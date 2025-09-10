@@ -1,3 +1,5 @@
+// app/mcp-client.js
+
 import { generateAuthUrl } from "./auth.server";
 import { getCustomerToken } from "./db.server";
 
@@ -7,32 +9,49 @@ import { getCustomerToken } from "./db.server";
  */
 class MCPClient {
   /**
-   * Creates a new MCPClient instance.
-   *
-   * @param {string} hostUrl - The base URL for the shop
-   * @param {string} conversationId - ID for the current conversation
-   * @param {string} shopId - ID of the Shopify shop
+   * @param {string} hostUrlOrDomain - myshopify domain or URL (e.g., nice-demo-store-ch.myshopify.com)
+   * @param {string} conversationId  - ID for the current conversation
+   * @param {string} shopId          - ID of the Shopify shop
+   * @param {string} customerMcpEndpoint - Optional explicit Customer MCP endpoint
    */
-  constructor(hostUrl, conversationId, shopId, customerMcpEndpoint) {
+  constructor(hostUrlOrDomain, conversationId, shopId, customerMcpEndpoint) {
+    // Normalize to hostname (no protocol, no trailing slash)
+    const hasProtocol = /^https?:\/\//i.test(hostUrlOrDomain);
+    const hostname = hasProtocol
+      ? new URL(hostUrlOrDomain).hostname
+      : hostUrlOrDomain;
+
+    this.shopDomain = hostname; // expected like nice-demo-store-ch.myshopify.com
+    this.conversationId = conversationId;
+    this.shopId = shopId;
+
+    // Prefer your custom domain for Storefront MCP if provided via env,
+    // otherwise use myshopify.com domain to avoid password/redirect HTML.
+    const storefrontBase =
+      (process.env.STOREFRONT_BASE_URL &&
+        process.env.STOREFRONT_BASE_URL.replace(/\/+$/, "")) ||
+      `https://${this.shopDomain}`;
+
+    this.storefrontMcpEndpoint = `${storefrontBase}/api/mcp`;
+
+    // Customer Accounts MCP runs on the account subdomain of myshopify.com:
+    // nice-demo-store-ch.account.myshopify.com
+    const accountHost = this.shopDomain.replace(
+      /\.myshopify\.com$/i,
+      ".account.myshopify.com"
+    );
+    this.customerMcpEndpoint =
+      customerMcpEndpoint ||
+      `https://${accountHost}/customer/api/mcp`;
+
+    this.customerAccessToken = "";
     this.tools = [];
     this.customerTools = [];
     this.storefrontTools = [];
-    // TODO: Make this dynamic, for that first we need to allow access of mcp tools on password proteted demo stores.
-    this.storefrontMcpEndpoint = `${hostUrl}/api/mcp`;
-
-    const accountHostUrl = hostUrl.replace(/(\.myshopify\.com)$/, '.account$1');
-    this.customerMcpEndpoint = customerMcpEndpoint || `${accountHostUrl}/customer/api/mcp`;
-    this.customerAccessToken = "";
-    this.conversationId = conversationId;
-    this.shopId = shopId;
   }
 
   /**
    * Connects to the customer MCP server and retrieves available tools.
-   * Attempts to use an existing token or will proceed without authentication.
-   *
-   * @returns {Promise<Array>} Array of available customer tools
-   * @throws {Error} If connection to MCP server fails
    */
   async connectToCustomerServer() {
     try {
@@ -40,19 +59,21 @@ class MCPClient {
 
       if (this.conversationId) {
         const dbToken = await getCustomerToken(this.conversationId);
-
-        if (dbToken && dbToken.accessToken) {
+        if (dbToken?.accessToken) {
           this.customerAccessToken = dbToken.accessToken;
         } else {
-          console.log("No token in database for conversation:", this.conversationId);
+          console.log(
+            "No token in database for conversation:",
+            this.conversationId
+          );
         }
       }
 
-      // If we still don't have a token, we'll connect without one
-      // and tools that require auth will prompt for it later
       const headers = {
         "Content-Type": "application/json",
-        "Authorization": this.customerAccessToken || ""
+        ...(this.customerAccessToken
+          ? { Authorization: `Bearer ${this.customerAccessToken}` }
+          : {}),
       };
 
       const response = await this._makeJsonRpcRequest(
@@ -62,8 +83,8 @@ class MCPClient {
         headers
       );
 
-      // Extract tools from the JSON-RPC response format
-      const toolsData = response.result && response.result.tools ? response.result.tools : [];
+      const toolsData =
+        response?.result && response.result.tools ? response.result.tools : [];
       const customerTools = this._formatToolsData(toolsData);
 
       this.customerTools = customerTools;
@@ -78,16 +99,13 @@ class MCPClient {
 
   /**
    * Connects to the storefront MCP server and retrieves available tools.
-   *
-   * @returns {Promise<Array>} Array of available storefront tools
-   * @throws {Error} If connection to MCP server fails
    */
   async connectToStorefrontServer() {
     try {
       console.log(`Connecting to MCP server at ${this.storefrontMcpEndpoint}`);
 
       const headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       };
 
       const response = await this._makeJsonRpcRequest(
@@ -97,8 +115,8 @@ class MCPClient {
         headers
       );
 
-      // Extract tools from the JSON-RPC response format
-      const toolsData = response.result && response.result.tools ? response.result.tools : [];
+      const toolsData =
+        response?.result && response.result.tools ? response.result.tools : [];
       const storefrontTools = this._formatToolsData(toolsData);
 
       this.storefrontTools = storefrontTools;
@@ -113,16 +131,11 @@ class MCPClient {
 
   /**
    * Dispatches a tool call to the appropriate MCP server based on the tool name.
-   *
-   * @param {string} toolName - Name of the tool to call
-   * @param {Object} toolArgs - Arguments to pass to the tool
-   * @returns {Promise<Object>} Result from the tool call
-   * @throws {Error} If tool is not found or call fails
    */
   async callTool(toolName, toolArgs) {
-    if (this.customerTools.some(tool => tool.name === toolName)) {
+    if (this.customerTools.some((tool) => tool.name === toolName)) {
       return this.callCustomerTool(toolName, toolArgs);
-    } else if (this.storefrontTools.some(tool => tool.name === toolName)) {
+    } else if (this.storefrontTools.some((tool) => tool.name === toolName)) {
       return this.callStorefrontTool(toolName, toolArgs);
     } else {
       throw new Error(`Tool ${toolName} not found`);
@@ -131,18 +144,13 @@ class MCPClient {
 
   /**
    * Calls a tool on the storefront MCP server.
-   *
-   * @param {string} toolName - Name of the storefront tool to call
-   * @param {Object} toolArgs - Arguments to pass to the tool
-   * @returns {Promise<Object>} Result from the tool call
-   * @throws {Error} If the tool call fails
    */
   async callStorefrontTool(toolName, toolArgs) {
     try {
       console.log("Calling storefront tool", toolName, toolArgs);
 
       const headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       };
 
       const response = await this._makeJsonRpcRequest(
@@ -163,34 +171,30 @@ class MCPClient {
   }
 
   /**
-   * Calls a tool on the customer MCP server.
-   * Handles authentication if needed.
-   *
-   * @param {string} toolName - Name of the customer tool to call
-   * @param {Object} toolArgs - Arguments to pass to the tool
-   * @returns {Promise<Object>} Result from the tool call or auth error
-   * @throws {Error} If the tool call fails
+   * Calls a tool on the customer MCP server (handles auth).
    */
   async callCustomerTool(toolName, toolArgs) {
     try {
       console.log("Calling customer tool", toolName, toolArgs);
-      // First try to get a token from the database for this conversation
+
       let accessToken = this.customerAccessToken;
 
-      if (!accessToken || accessToken === "") {
+      if (!accessToken) {
         const dbToken = await getCustomerToken(this.conversationId);
-
-        if (dbToken && dbToken.accessToken) {
+        if (dbToken?.accessToken) {
           accessToken = dbToken.accessToken;
-          this.customerAccessToken = accessToken; // Store it for later use
+          this.customerAccessToken = accessToken;
         } else {
-          console.log("No token in database for conversation:", this.conversationId);
+          console.log(
+            "No token in database for conversation:",
+            this.conversationId
+          );
         }
       }
 
       const headers = {
         "Content-Type": "application/json",
-        "Authorization": accessToken
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
       };
 
       try {
@@ -206,23 +210,20 @@ class MCPClient {
 
         return response.result || response;
       } catch (error) {
-        // Handle 401 specifically to trigger authentication
         if (error.status === 401) {
           console.log("Unauthorized, generating authorization URL for customer");
+          const authResponse = await generateAuthUrl(
+            this.conversationId,
+            this.shopId
+          );
 
-          // Generate auth URL
-          const authResponse = await generateAuthUrl(this.conversationId, this.shopId);
-
-          // Instead of retrying, return the auth URL for the front-end
           return {
             error: {
               type: "auth_required",
-              data: `You need to authorize the app to access your customer data. [Click here to authorize](${authResponse.url})`
-            }
+              data: `You need to authorize the app to access your customer data. [Click here to authorize](${authResponse.url})`,
+            },
           };
         }
-
-        // Re-throw other errors
         throw error;
       }
     } catch (error) {
@@ -230,61 +231,60 @@ class MCPClient {
       return {
         error: {
           type: "internal_error",
-          data: `Error calling tool ${toolName}: ${error.message}`
-        }
+          data: `Error calling tool ${toolName}: ${error.message}`,
+        },
       };
     }
   }
 
   /**
-   * Makes a JSON-RPC request to the specified endpoint.
-   *
-   * @private
-   * @param {string} endpoint - The endpoint URL
-   * @param {string} method - The JSON-RPC method to call
-   * @param {Object} params - Parameters for the method
-   * @param {Object} headers - HTTP headers for the request
-   * @returns {Promise<Object>} Parsed JSON response
-   * @throws {Error} If the request fails
+   * Makes a JSON-RPC request and provides helpful diagnostics if the response is HTML.
    */
   async _makeJsonRpcRequest(endpoint, method, params, headers) {
-    const response = await fetch(endpoint, {
+    const res = await fetch(endpoint, {
       method: "POST",
-      headers: headers,
+      headers,
       body: JSON.stringify({
         jsonrpc: "2.0",
-        method: method,
-        id: 1,
-        params: params
+        method,
+        id: Date.now(),
+        params,
       }),
     });
 
-    if (!response.ok) {
-      const error = await response.text();
-      const errorObj = new Error(`Request failed: ${response.status} ${error}`);
-      errorObj.status = response.status;
-      throw errorObj;
+    const text = await res.text();
+
+    if (!res.ok) {
+      const err = new Error(
+        `Request failed: ${res.status} ${res.statusText} — ${text.slice(0, 200)}`
+      );
+      err.status = res.status;
+      throw err;
     }
 
-    return await response.json();
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      console.error("MCP response not JSON", {
+        endpoint,
+        status: res.status,
+        location: res.headers.get("location"),
+        snippet: text.slice(0, 200),
+      });
+      throw e;
+    }
   }
 
   /**
    * Formats raw tool data into a consistent format.
-   *
-   * @private
-   * @param {Array} toolsData - Raw tools data from the API
-   * @returns {Array} Formatted tools data
    */
   _formatToolsData(toolsData) {
-    return toolsData.map((tool) => {
-      return {
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.inputSchema || tool.input_schema,
-      };
-    });
-  }
+    return toolsData.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.inputSchema || tool.input_schema,
+    }));
+    }
 }
 
 export default MCPClient;
